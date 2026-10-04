@@ -363,7 +363,7 @@ curl -s http://localhost:8000/fixtures/slice \
 - **逐份校验**：每份 fixture 都先对照表结构校验——表集合一致、`row_counts` 与实际行数一致、每个声明列的值都能按声明类型解析、单列 `unique` / 复合 `unique_constraints` 与外键在 fixture 内部完好；任何一份不合格，整体返回 **422**，错误 `loc` 以 `["body", "fixtures", <序号>, ...]` 指出是哪一份。
 - **整行相同去重**：唯一键相同且**整行**（含表结构之外的额外字段）完全相同的行是同一条记录，只保留第一份（SQL 语义：含 `null` 的唯一键不参与冲突与去重判定）。
 - **冲突改写**：唯一键冲突但整行不同的行，保留先出现的行，后出现的行按 `sha256(seed, "merge", 表名, 列名)` 派生的随机流生成**格式合法的新唯一值**——遵守类型、`min/max_value`、`min/max_length`、`prefix`、`choices` 等约束；唯一外键列则从目标表的现有值中另选一个。
-- **引用同步改写**：被改写的唯一值沿外键依赖图同步级联——同一份 fixture 内的子表外键、自引用外键、复合约束列和多层关系全部跟随新值；其他 fixture 的引用不受影响。复合唯一约束冲突优先只改写约束中的一列，单列无解时整体重生成该组合键。
+- **引用同步改写**：被改写的唯一值沿外键依赖图同步级联——同一份 fixture 内的子表外键、自引用外键、复合约束列和多层关系全部跟随新值；其他 fixture 的引用不受影响。级联按**原始引用逐跳追踪到最终值**：即使某张表的唯一列本身就是引用上游的外键（A→B→C 中 C 引用的正是 B 的该列），上游造成的键变化也会继续传给同源的下游引用；若该列又因唯一冲突被另选新值、或所在行与更早的整行副本去重，所有引用最终都指向**实际保留的那条记录**。复合唯一约束冲突优先只改写约束中的一列，单列无解时整体重生成该组合键。
 - **原样保留**：未冲突的值和表结构之外的额外字段逐字节保留；行顺序稳定（按 `fixtures` 提交顺序、每份内部保持原行序），表顺序与表结构声明顺序一致；相同输入与 `seed` 结果逐字节可复现。
 - **全有或全无**：唯一取值空间耗尽（如唯一 `boolean` 列合并后需要第三个值、唯一外键列的可引用值不够）、约束无法满足或输入不一致时，整体返回 **422**，不输出半成品。
 
@@ -442,6 +442,80 @@ curl -s http://localhost:8000/fixtures/merge \
 ```
 
 第二份的 `{"id": 1, "email": "a@x.example"}` 与第一份整行相同，被去重；`{"id": 2, "email": "c@x.example"}` 唯一键冲突但内容不同，`id` 被改写为 seed 派生的新值 `91192`，第二份订单的 `user_id` 同步指向 `91192`；未冲突的 `email`、`orders.id` 等全部原样保留。相同请求与 seed 再次调用结果逐字节一致。
+
+#### 多层外键：引用按原始来源追踪到最终值
+
+当一张表的唯一键**本身就是引用上游的外键列**，而第三张表又引用这同一列（`accounts ← members.account_id ← events.member_account`）时，两份 fixture 的 `accounts.id` 同为 `1` 但账户名不同：第二份账户被改写、第二份会员的 `account_id` 随引用更新，第二份事件的外键也必须继续跟随会员的新键，而不会错连到第一份的会员。
+
+```bash
+curl -s http://localhost:8000/fixtures/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "fixtures": [
+      {
+        "seed": 1,
+        "row_counts": {"accounts": 1, "members": 1, "events": 1},
+        "tables": {
+          "accounts": [{"id": 1, "name": "one11111"}],
+          "members": [{"account_id": 1}],
+          "events": [{"id": 100, "member_account": 1}]
+        }
+      },
+      {
+        "seed": 2,
+        "row_counts": {"accounts": 1, "members": 1, "events": 1},
+        "tables": {
+          "accounts": [{"id": 1, "name": "two22222"}],
+          "members": [{"account_id": 1}],
+          "events": [{"id": 200, "member_account": 1}]
+        }
+      }
+    ],
+    "tables": [
+      {"name": "accounts", "rows": 1, "fields": {
+        "id": {"type": "int", "min_value": 1, "max_value": 1000, "unique": true},
+        "name": {"type": "string"}}},
+      {"name": "members", "rows": 1, "fields": {
+        "account_id": {"type": "int", "min_value": 1, "max_value": 1000,
+                       "unique": true}},
+       "foreign_keys": [
+         {"column": "account_id", "references_table": "accounts",
+          "nullable": false}]},
+      {"name": "events", "rows": 1, "fields": {
+        "id": {"type": "int", "min_value": 1, "max_value": 1000,
+               "unique": true}},
+       "foreign_keys": [
+         {"column": "member_account", "references_table": "members",
+          "references_column": "account_id", "nullable": false}]}
+    ],
+    "seed": 42
+  }'
+```
+
+响应（`seed: 42` 下的真实输出）：第二份的会员与事件都指向改写后的账户 `209`，第一份整条链保持原值：
+
+```json
+{
+  "seed": 42,
+  "row_counts": {"accounts": 2, "members": 2, "events": 2},
+  "tables": {
+    "accounts": [
+      {"id": 1, "name": "one11111"},
+      {"id": 209, "name": "two22222"}
+    ],
+    "members": [
+      {"account_id": 1},
+      {"account_id": 209}
+    ],
+    "events": [
+      {"id": 100, "member_account": 1},
+      {"id": 200, "member_account": 209}
+    ]
+  }
+}
+```
+
+若第二份会员行又因 `account_id` 唯一冲突而被另选、或与更早的整行副本去重，事件的引用同样会落到最终保留的会员记录上；其他来源的引用、无冲突值与额外字段均原样保留。
 
 ## 复现性说明
 

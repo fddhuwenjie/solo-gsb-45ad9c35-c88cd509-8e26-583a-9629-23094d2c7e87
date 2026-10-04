@@ -361,6 +361,189 @@ def test_merge_cascade_flows_through_multi_level_chain():
     assert out["employees"][0] == {"id": 100, "dept_id": 10}
 
 
+def test_merge_three_level_carried_fk_follows_own_source_chain():
+    """A→B→C where B's *own* unique key is the FK to A, and C references
+    that same column. When the second fixture's A key collides (same key,
+    different content), A is rewritten, B's key follows — and C must follow
+    B's new key too, not stay on the first fixture's B.
+    """
+    tables = [
+        {"name": "accounts", "rows": 1, "fields": {
+            "id": {"type": "int", "min_value": 1, "max_value": 1000,
+                   "unique": True},
+            "name": {"type": "string"}}},
+        {"name": "members", "rows": 1, "fields": {
+            "account_id": {"type": "int", "min_value": 1, "max_value": 1000,
+                           "unique": True},
+            "tier": {"type": "string"}},
+         "foreign_keys": [
+             {"column": "account_id", "references_table": "accounts",
+              "nullable": False}]},
+        {"name": "events", "rows": 2, "fields": {
+            "id": {"type": "int", "min_value": 1, "max_value": 1000,
+                   "unique": True}},
+         "foreign_keys": [
+             {"column": "member_account", "references_table": "members",
+              "references_column": "account_id", "nullable": False}]},
+    ]
+    fx1 = {"seed": 1, "row_counts": {"accounts": 1, "members": 1, "events": 2},
+           "tables": {
+               "accounts": [{"id": 1, "name": "one11111"}],
+               "members": [{"account_id": 1, "tier": "gold0000"}],
+               # two children, both carrying an extra field verbatim
+               "events": [
+                   {"id": 100, "member_account": 1, "kind": "login000"},
+                   {"id": 101, "member_account": 1, "kind": "click000"}],
+           }}
+    fx2 = {"seed": 2, "row_counts": {"accounts": 1, "members": 1, "events": 2},
+           "tables": {
+               "accounts": [{"id": 1, "name": "two22222"}],  # key clash
+               "members": [{"account_id": 1, "tier": "silver00"}],
+               "events": [
+                   {"id": 200, "member_account": 1, "kind": "login000"},
+                   {"id": 201, "member_account": 1, "kind": "view0000"}],
+           }}
+    r = merge([fx1, fx2], tables, seed=42)
+    assert r.status_code == 200, r.text
+    out = r.json()["tables"]
+
+    accounts = out["accounts"]
+    assert accounts[0] == {"id": 1, "name": "one11111"}
+    new_account_id = accounts[1]["id"]
+    assert new_account_id != 1 and accounts[1]["name"] == "two22222"
+
+    members = out["members"]
+    # fx1's member is untouched; fx2's member followed its own account
+    assert members[0] == {"account_id": 1, "tier": "gold0000"}
+    assert members[1] == {"account_id": new_account_id, "tier": "silver00"}
+
+    events = out["events"]
+    assert [e["id"] for e in events] == [100, 101, 200, 201]
+    # every reference from fx1 lands on fx1's member; every reference from
+    # fx2 lands on fx2's member — never cross-linked to the other source
+    assert {e["member_account"] for e in events[:2]} == {1}
+    assert {e["member_account"] for e in events[2:]} == {new_account_id}
+    # unconflicted values and extra fields are verbatim
+    assert events[2]["kind"] == "login000"
+    assert events[3]["kind"] == "view0000"
+    member_keys = {m["account_id"] for m in members}
+    assert all(e["member_account"] in member_keys for e in events)
+
+
+def test_merge_four_level_carried_fk_chain_tracks_to_final_key():
+    """The lineage tracking extends over an arbitrary chain length: a value
+    moved at level 1 keeps propagating through levels 2, 3 and 4 from each
+    child's original reference.
+    """
+    tables = [
+        {"name": "a", "rows": 1, "fields": {
+            "id": {"type": "int", "min_value": 1, "max_value": 1000,
+                   "unique": True},
+            "label": {"type": "string"}}},
+        {"name": "b", "rows": 1, "fields": {
+            "a_id": {"type": "int", "min_value": 1, "max_value": 1000,
+                     "unique": True}},
+         "foreign_keys": [
+             {"column": "a_id", "references_table": "a", "nullable": False}]},
+        {"name": "c", "rows": 1, "fields": {
+            "b_aid": {"type": "int", "min_value": 1, "max_value": 1000,
+                      "unique": True}},
+         "foreign_keys": [
+             {"column": "b_aid", "references_table": "b",
+              "references_column": "a_id", "nullable": False}]},
+        {"name": "d", "rows": 1, "fields": {
+            "id": {"type": "int", "min_value": 1, "max_value": 1000,
+                   "unique": True}},
+         "foreign_keys": [
+             {"column": "c_baid", "references_table": "c",
+              "references_column": "b_aid", "nullable": False}]},
+    ]
+
+    def chain_fx(label, seed):
+        return {"seed": seed,
+                "row_counts": {"a": 1, "b": 1, "c": 1, "d": 1},
+                "tables": {
+                    "a": [{"id": 1, "label": label}],
+                    "b": [{"a_id": 1}],
+                    "c": [{"b_aid": 1}],
+                    "d": [{"id": 900, "c_baid": 1}],
+                }}
+
+    r = merge([chain_fx("one11111", 1), chain_fx("two22222", 2)],
+              tables, seed=11)
+    assert r.status_code == 200, r.text
+    out = r.json()["tables"]
+    new_a = out["a"][1]["id"]
+    assert new_a != 1
+    assert out["b"][1]["a_id"] == new_a
+    assert out["c"][1]["b_aid"] == new_a
+    assert out["d"][1]["c_baid"] == new_a
+    # first fixture's whole chain is verbatim
+    assert out["a"][0] == {"id": 1, "label": "one11111"}
+    assert out["b"][0] == {"a_id": 1}
+    assert out["c"][0] == {"b_aid": 1}
+    assert out["d"][0] == {"id": 900, "c_baid": 1}
+
+
+def test_merge_consecutive_rewrites_dedup_then_repick_points_at_kept_row():
+    """A copied B row is deduplicated against an earlier fixture, and the
+    surviving copy must itself be repicked to another parent (unique FK
+    clash). A third fixture whose references used the old value must end on
+    the record that actually survives — after every consecutive rewrite.
+    """
+    tables = [
+        {"name": "a", "rows": 2, "fields": {
+            "id": {"type": "int", "min_value": 1, "max_value": 1000,
+                   "unique": True}}},
+        {"name": "b", "rows": 1, "fields": {
+            "a_id": {"type": "int", "min_value": 1, "max_value": 1000,
+                     "unique": True},
+            "tag": {"type": "string"}},
+         "foreign_keys": [
+             {"column": "a_id", "references_table": "a", "nullable": False}]},
+        {"name": "c", "rows": 1, "fields": {
+            "id": {"type": "int", "min_value": 1, "max_value": 1000,
+                   "unique": True}},
+         "foreign_keys": [
+             {"column": "b_aid", "references_table": "b",
+              "references_column": "a_id", "nullable": False}]},
+    ]
+
+    def fixture(seed, a_rows, b_row, c_id):
+        return {"seed": seed,
+                "row_counts": {"a": len(a_rows), "b": 1, "c": 1},
+                "tables": {
+                    "a": [{"id": v} for v in a_rows],
+                    "b": [b_row],
+                    "c": [{"id": c_id, "b_aid": b_row["a_id"]}],
+                }}
+
+    fx1 = fixture(1, [1, 2], {"a_id": 1, "tag": "kept0000"}, 100)
+    # identical B copy from fx2 is the first duplicate -> kept as second B
+    fx2 = fixture(2, [1], {"a_id": 1, "tag": "copied00"}, 200)
+    # same identical B copy again -> deduplicated against fx2's survivor,
+    # which then has to repick a_id (1 is already taken by fx1's B)
+    fx3 = fixture(3, [1], {"a_id": 1, "tag": "copied00"}, 300)
+    r = merge([fx1, fx2, fx3], tables, seed=42)
+    assert r.status_code == 200, r.text
+    out = r.json()["tables"]
+
+    members = out["b"]
+    assert len(members) == 2
+    assert members[0] == {"a_id": 1, "tag": "kept0000"}
+    kept_aid = members[1]["a_id"]
+    assert kept_aid == 2  # only other parent value available
+    assert members[1]["tag"] == "copied00"
+
+    events = out["c"]
+    assert [e["id"] for e in events] == [100, 200, 300]
+    # fx2's and fx3's references both end on the single surviving copied B,
+    # even though fx3's copy was dropped and the kept one was repicked
+    assert events[0]["b_aid"] == 1
+    assert events[1]["b_aid"] == kept_aid
+    assert events[2]["b_aid"] == kept_aid
+
+
 def test_merge_self_referencing_tree_cascades():
     tables = [{"name": "nodes", "rows": 2, "fields": {
         "id": {"type": "int", "min_value": 1, "max_value": 1000,

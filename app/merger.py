@@ -15,9 +15,12 @@ satisfies every unique and foreign-key constraint:
   values drawn from the merge seed (respecting type, range, length, prefix
   and choices; FK columns pick another existing parent value);
 * every rewrite cascades along the FK dependency graph — across tables,
-  through self-references and over composite constraints — so references
-  from the same source fixture keep pointing at the rewritten row, while
-  other fixtures' references stay untouched;
+  through multi-level chains (a column that is both an outbound FK and the
+  target of the next level's FK), through self-references and over composite
+  constraints — by tracking each row's reference from its value in the
+  *input* fixture to the value the same-source row finally keeps, so child
+  references follow rewritten and deduplicated parents while other fixtures'
+  references stay untouched;
 * non-conflicting values and fields outside the schema are copied verbatim;
   row order is stable (fixture order, then original row order) and tables
   follow the schema declaration order.
@@ -207,25 +210,36 @@ def _merge_table(
 ) -> list[list[Any]]:
     """Merge one table's rows across all fixtures.
 
-    Returns ``[[fixture_index, row], ...]`` in stable merge order; rewrites
-    of referenced columns are recorded into ``cascades`` so child tables can
-    follow them.
+    Returns ``[[fixture_index, row, origins], ...]`` in stable merge order.
+    ``origins`` snapshots the row's values exactly as they arrived in the
+    input fixture, before any rewrite.  Rewrites are published into
+    ``cascades`` only after the whole table has settled: the map for each
+    referenced column sends every row's original value to that row's final
+    value, so multi-level chains (A→B→C where B carries the column that C
+    references) and consecutive rewrites both follow the lineage of the row
+    as it was in the input fixture, and copies removed by deduplication alias
+    the record kept.
     """
+    # The snapshot holds the row's *input* values for every column: inbound
+    # FKs follow referenced columns, outbound FKs are looked up from it.
     rows: list[list[Any]] = []
     for f_i, fx in enumerate(fixtures):
         for row in fx.tables[name]:
-            rows.append([f_i, dict(row)])
+            snap = dict(row)
+            rows.append([f_i, dict(row), snap])
 
-    # Rewrites from already-merged parent tables: a reference from fixture
-    # f to a rewritten parent key follows that key's new value.
+    # Rewrites from already-merged parent tables.  A reference is followed
+    # from its value in the *input* fixture: lookup uses the snapshot, so a
+    # value already moved by one parent rewrite is never looked up with the
+    # intermediate value (which would miss the second step of a chain).
     for col, fk in fks.items():
         if fk.references_table == name:
             continue  # self-references are handled together with their target
         mapping = cascades.get((fk.references_table, fk.references_column))
         if not mapping:
             continue
-        for f_i, row in rows:
-            value = row.get(col)
+        for f_i, row, origins in rows:
+            value = origins.get(col)
             if value is None:
                 continue
             new_value = mapping.get((f_i, value), _MISSING)
@@ -238,6 +252,8 @@ def _merge_table(
     # Fully identical rows sharing a non-null unique key are the same
     # logical record: keep the first copy only. SQL NULL semantics: keys
     # containing NULL never collide, so such duplicates all stay.
+    # (fixture index, frozen row, kept row index) for copies dropped below.
+    aliases: list[tuple[int, Any, int]] = []
     if unique_cols or composite:
 
         def has_key(r: dict[str, Any]) -> bool:
@@ -247,20 +263,24 @@ def _merge_table(
                 None not in tuple(r.get(c) for c in uc) for uc in composite
             )
 
-        seen: set = set()
+        seen: dict = {}
         deduped: list[list[Any]] = []
-        for f_i, row in rows:
+        for f_i, row, origins in rows:
             frozen = _freeze(row)
             if frozen in seen and has_key(row):
+                # An identical logical record from another fixture is
+                # dropped; references from its source must end on the copy
+                # that survives.
+                aliases.append((f_i, frozen, seen[frozen]))
                 continue
-            seen.add(frozen)
-            deduped.append([f_i, row])
+            seen[frozen] = len(deduped)
+            deduped.append([f_i, row, origins])
         rows = deduped
 
     # --- uniqueness state --------------------------------------------------
     col_counts = {c: _Counts() for c in unique_cols}
     tup_counts = [_Counts() for _ in composite]
-    for _, row in rows:
+    for _, row, _ in rows:
         for c in unique_cols:
             v = row.get(c)
             if v is not None:
@@ -273,7 +293,7 @@ def _merge_table(
     def pool_values(fk: ForeignKey) -> list[Any]:
         if fk.references_table == name:
             return [
-                r.get(fk.references_column) for _, r in rows
+                r.get(fk.references_column) for _, r, _ in rows
                 if r.get(fk.references_column) is not None
             ]
         return pools.get(fk.references_table, {}).get(fk.references_column, [])
@@ -286,7 +306,7 @@ def _merge_table(
 
     # --- feasibility: the merged value space must fit every unique key -----
     for c in unique_cols:
-        needed = sum(1 for _, r in rows if r.get(c) is not None)
+        needed = sum(1 for _, r, _ in rows if r.get(c) is not None)
         size = domain_of(c)
         if size is not None and size < needed:
             raise FixtureValidationError([_err(
@@ -297,7 +317,7 @@ def _merge_table(
             )])
     for i, uc in enumerate(composite):
         needed = sum(
-            1 for _, r in rows if all(r.get(c) is not None for c in uc)
+            1 for _, r, _ in rows if all(r.get(c) is not None for c in uc)
         )
         sizes = [domain_of(c) for c in uc]
         if all(s is not None for s in sizes):
@@ -399,7 +419,7 @@ def _merge_table(
         return None
 
     def set_value(idx: int, col: str, new_value: Any) -> None:
-        f_i, row = rows[idx]
+        f_i, row, _origins = rows[idx]
         old = row[col]
         old_keys = {
             i: tuple(row.get(c) for c in uc)
@@ -416,11 +436,11 @@ def _merge_table(
             new_key = tuple(row.get(c) for c in composite[i])
             if None not in new_key:
                 tup_counts[i].add(new_key, +1)
-        if col in referenced_here:
-            cascades.setdefault((name, col), {})[(f_i, old)] = new_value
         # Self-references from the same fixture follow the rewritten key.
+        # Cross-table descendants are not touched here: they resolve the
+        # whole lineage from the final cascade map published below.
         for sc in self_by_target.get(col, ()):
-            for j, (f_j, other) in enumerate(rows):
+            for j, (f_j, other, _) in enumerate(rows):
                 if f_j == f_i and other.get(sc) == old:
                     set_value(j, sc, new_value)
 
@@ -442,7 +462,7 @@ def _merge_table(
             # Keep the first occurrence; rewrite a later duplicate.
             seen_keys: set = set()
             idx = -1
-            for j, (_, r) in enumerate(rows):
+            for j, (_, r, _) in enumerate(rows):
                 v = r.get(single)
                 if v is None:
                     continue
@@ -463,7 +483,7 @@ def _merge_table(
         uc = composite[comp_i]
         seen_keys = set()
         idx = -1
-        for j, (_, r) in enumerate(rows):
+        for j, (_, r, _) in enumerate(rows):
             key = tuple(r.get(c) for c in uc)
             if None in key:
                 continue
@@ -496,6 +516,30 @@ def _merge_table(
             f"表 {name!r} 的合并冲突在 {max_rounds} 轮内未能全部解决",
             ["tables", str(t_idx)],
         )])
+
+    # --- publish the settled lineage for downstream tables -----------------
+    # Every surviving row maps the value it carried *in the input fixture* to
+    # its final value in this table, on every column a child table can
+    # reference.  Looking the chain up from the child's own input value then
+    # always lands on the final kept record: parent rewrites (possibly
+    # several in a row, across A→B→C), unique-conflict rewrites of the
+    # referenced column itself and deduplicated copies all resolve here.
+    for col in referenced_here:
+        mapping = cascades.setdefault((name, col), {})
+        for f_i, row, origins in rows:
+            old = origins.get(col)
+            new = row.get(col)
+            if old is None or old == new:
+                continue
+            mapping[(f_i, old)] = new
+        # A copy dropped as a fully identical duplicate keeps pointing at the
+        # surviving record, whatever value its referenced column settled on.
+        for f_i, _frozen, kept_idx in aliases:
+            old = rows[kept_idx][2].get(col)
+            new = rows[kept_idx][1].get(col)
+            if old is None or old == new:
+                continue
+            mapping.setdefault((f_i, old), new)
 
     return rows
 
@@ -552,11 +596,11 @@ def merge(
         )
         # Publish this table's unique columns for downstream FK pools.
         pools[name] = {
-            c: [r.get(c) for _, r in rows if r.get(c) is not None]
+            c: [r.get(c) for _, r, _ in rows if r.get(c) is not None]
             for c, s in effective[name].items()
             if s.unique
         }
-        merged[name] = [r for _, r in rows]
+        merged[name] = [r for _, r, _ in rows]
 
     # Defensive: the merged fixture must satisfy every constraint.
     try:
