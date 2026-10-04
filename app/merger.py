@@ -17,7 +17,10 @@ satisfies every unique and foreign-key constraint:
 * every rewrite cascades along the FK dependency graph — across tables,
   through self-references and over composite constraints — so references
   from the same source fixture keep pointing at the rewritten row, while
-  other fixtures' references stay untouched;
+  other fixtures' references stay untouched; a key changed by an upstream
+  cascade is re-published for its own children and consecutive rewrites
+  of the same key compose, so every reference resolves to the final
+  surviving record in a single lookup;
 * non-conflicting values and fields outside the schema are copied verbatim;
   row order is stable (fixture order, then original row order) and tables
   follow the schema declaration order.
@@ -192,6 +195,32 @@ class _Counts:
 # ------------------------------------------------------------- table merging
 
 
+def _record_cascade(
+    cascades: dict[tuple[str, str], dict[tuple[int, Any], Any]],
+    name: str,
+    col: str,
+    f_i: int,
+    old: Any,
+    new: Any,
+) -> None:
+    """Record that fixture ``f_i``'s value ``old`` in ``name.col`` lives at
+    ``new`` now.
+
+    Mappings are keyed by each fixture's *original* value and stay
+    transitive: entries that used to point at ``old`` are redirected to
+    ``new``, so a child table reaches the final value of its original
+    reference in one lookup even when the key was rewritten several times
+    in a row (upstream cascade, then a uniqueness rewrite of its own).
+    """
+    if old == new:
+        return
+    mapping = cascades.setdefault((name, col), {})
+    for key, target in mapping.items():
+        if key[0] == f_i and target == old:
+            mapping[key] = new
+    mapping[(f_i, old)] = new
+
+
 def _merge_table(
     name: str,
     t_idx: int,
@@ -217,20 +246,36 @@ def _merge_table(
             rows.append([f_i, dict(row)])
 
     # Rewrites from already-merged parent tables: a reference from fixture
-    # f to a rewritten parent key follows that key's new value.
+    # f to a rewritten parent key follows that key's new value. When the
+    # followed column is itself referenced (by a later table or by a
+    # self-reference), the follow is re-published as another cascade keyed
+    # by the fixture's original value, so the rewrite keeps propagating
+    # down the dependency chain instead of stranding grandchildren on the
+    # previous key value.
+    def follow_rewrite(idx: int, col: str, old: Any, new: Any) -> None:
+        f_i, row = rows[idx]
+        row[col] = new
+        if col in referenced_here:
+            _record_cascade(cascades, name, col, f_i, old, new)
+        # Self-references from the same fixture follow the rewritten key.
+        for sc in self_by_target.get(col, ()):
+            for j, (f_j, other) in enumerate(rows):
+                if f_j == f_i and other.get(sc) == old:
+                    follow_rewrite(j, sc, old, new)
+
     for col, fk in fks.items():
         if fk.references_table == name:
             continue  # self-references are handled together with their target
         mapping = cascades.get((fk.references_table, fk.references_column))
         if not mapping:
             continue
-        for f_i, row in rows:
+        for idx, (f_i, row) in enumerate(rows):
             value = row.get(col)
             if value is None:
                 continue
             new_value = mapping.get((f_i, value), _MISSING)
-            if new_value is not _MISSING:
-                row[col] = new_value
+            if new_value is not _MISSING and new_value != value:
+                follow_rewrite(idx, col, value, new_value)
 
     unique_cols = [c for c, s in eff.items() if s.unique]
     composite = [tuple(uc) for uc in table.unique_constraints]
@@ -417,7 +462,7 @@ def _merge_table(
             if None not in new_key:
                 tup_counts[i].add(new_key, +1)
         if col in referenced_here:
-            cascades.setdefault((name, col), {})[(f_i, old)] = new_value
+            _record_cascade(cascades, name, col, f_i, old, new_value)
         # Self-references from the same fixture follow the rewritten key.
         for sc in self_by_target.get(col, ()):
             for j, (f_j, other) in enumerate(rows):

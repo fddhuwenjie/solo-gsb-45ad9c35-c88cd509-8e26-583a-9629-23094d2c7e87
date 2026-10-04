@@ -363,7 +363,7 @@ curl -s http://localhost:8000/fixtures/slice \
 - **逐份校验**：每份 fixture 都先对照表结构校验——表集合一致、`row_counts` 与实际行数一致、每个声明列的值都能按声明类型解析、单列 `unique` / 复合 `unique_constraints` 与外键在 fixture 内部完好；任何一份不合格，整体返回 **422**，错误 `loc` 以 `["body", "fixtures", <序号>, ...]` 指出是哪一份。
 - **整行相同去重**：唯一键相同且**整行**（含表结构之外的额外字段）完全相同的行是同一条记录，只保留第一份（SQL 语义：含 `null` 的唯一键不参与冲突与去重判定）。
 - **冲突改写**：唯一键冲突但整行不同的行，保留先出现的行，后出现的行按 `sha256(seed, "merge", 表名, 列名)` 派生的随机流生成**格式合法的新唯一值**——遵守类型、`min/max_value`、`min/max_length`、`prefix`、`choices` 等约束；唯一外键列则从目标表的现有值中另选一个。
-- **引用同步改写**：被改写的唯一值沿外键依赖图同步级联——同一份 fixture 内的子表外键、自引用外键、复合约束列和多层关系全部跟随新值；其他 fixture 的引用不受影响。复合唯一约束冲突优先只改写约束中的一列，单列无解时整体重生成该组合键。
+- **引用同步改写**：被改写的唯一值沿外键依赖图同步级联——同一份 fixture 内的子表外键、自引用外键、复合约束列和多层关系全部跟随新值；其他 fixture 的引用不受影响。中间表的键若是被上游级联改写的，会以该 fixture 的原始值为键继续向下游发布，连续改写始终解析到最终保留的记录（见下方三层级联示例）。复合唯一约束冲突优先只改写约束中的一列，单列无解时整体重生成该组合键。
 - **原样保留**：未冲突的值和表结构之外的额外字段逐字节保留；行顺序稳定（按 `fixtures` 提交顺序、每份内部保持原行序），表顺序与表结构声明顺序一致；相同输入与 `seed` 结果逐字节可复现。
 - **全有或全无**：唯一取值空间耗尽（如唯一 `boolean` 列合并后需要第三个值、唯一外键列的可引用值不够）、约束无法满足或输入不一致时，整体返回 **422**，不输出半成品。
 
@@ -442,6 +442,80 @@ curl -s http://localhost:8000/fixtures/merge \
 ```
 
 第二份的 `{"id": 1, "email": "a@x.example"}` 与第一份整行相同，被去重；`{"id": 2, "email": "c@x.example"}` 唯一键冲突但内容不同，`id` 被改写为 seed 派生的新值 `91192`，第二份订单的 `user_id` 同步指向 `91192`；未冲突的 `email`、`orders.id` 等全部原样保留。相同请求与 seed 再次调用结果逐字节一致。
+
+### 三层级联示例
+
+链式结构 `orgs → sites → devices`：`sites.org_id` 是唯一外键（引用 `orgs.id`），而 `devices.site_org` 引用的正是 `sites.org_id` 这一列。两份 fixture 的 `orgs.id` 都是 `1` 但内容不同，第二份的 `id` 被改写后，改写会一级一级传到 `devices`：
+
+```bash
+curl -s http://localhost:8000/fixtures/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "fixtures": [
+      {
+        "seed": 1,
+        "row_counts": {"orgs": 1, "sites": 1, "devices": 1},
+        "tables": {
+          "orgs": [{"id": 1, "name": "acme"}],
+          "sites": [{"org_id": 1, "name": "hq"}],
+          "devices": [{"site_org": 1, "name": "router"}]
+        }
+      },
+      {
+        "seed": 2,
+        "row_counts": {"orgs": 1, "sites": 1, "devices": 1},
+        "tables": {
+          "orgs": [{"id": 1, "name": "globex"}],
+          "sites": [{"org_id": 1, "name": "lab"}],
+          "devices": [{"site_org": 1, "name": "sensor"}]
+        }
+      }
+    ],
+    "tables": [
+      {"name": "orgs", "rows": 1, "fields": {
+        "id": {"type": "int", "min_value": 1, "max_value": 100000, "unique": true},
+        "name": {"type": "string", "min_length": 2, "max_length": 12}}},
+      {"name": "sites", "rows": 1, "fields": {
+        "org_id": {"type": "int", "unique": true},
+        "name": {"type": "string", "min_length": 2, "max_length": 12}},
+       "foreign_keys": [
+         {"column": "org_id", "references_table": "orgs",
+          "references_column": "id", "nullable": false}]},
+      {"name": "devices", "rows": 1, "fields": {
+        "site_org": {"type": "int"},
+        "name": {"type": "string", "min_length": 2, "max_length": 12}},
+       "foreign_keys": [
+         {"column": "site_org", "references_table": "sites",
+          "references_column": "org_id", "nullable": false}]}
+    ],
+    "seed": 7
+  }'
+```
+
+响应（`seed: 7` 下的真实输出）：
+
+```json
+{
+  "seed": 7,
+  "row_counts": {"orgs": 2, "sites": 2, "devices": 2},
+  "tables": {
+    "orgs": [
+      {"id": 1, "name": "acme"},
+      {"id": 77739, "name": "globex"}
+    ],
+    "sites": [
+      {"org_id": 1, "name": "hq"},
+      {"org_id": 77739, "name": "lab"}
+    ],
+    "devices": [
+      {"site_org": 1, "name": "router"},
+      {"site_org": 77739, "name": "sensor"}
+    ]
+  }
+}
+```
+
+第二份的 `orgs.id` 因冲突被改写为 `77739`；`sites.org_id` 跟随到 `77739` 后，这一新键又作为级联继续向下游发布，因此第二份 `devices.site_org` 也指向 `77739`——每一级的引用都以各自 fixture 的原始值为键追踪到最终保留的记录，第一份的三行则全部原样保留。
 
 ## 复现性说明
 

@@ -387,6 +387,230 @@ def test_merge_self_referencing_tree_cascades():
     assert rows[2]["parent_id"] == new_root["id"]  # self-reference cascaded
 
 
+# ------------------------------------------- multi-level cascade relinking
+
+
+def abc_schema():
+    """A -> B -> C where C references B's unique FK column (B.a_id)."""
+    return [
+        {"name": "a", "rows": 1, "fields": {
+            "id": {"type": "int", "min_value": 1, "max_value": 1000,
+                   "unique": True},
+            "name": {"type": "string"}}},
+        {"name": "b", "rows": 1, "fields": {
+            "a_id": {"type": "int", "unique": True},
+            "label": {"type": "string"}},
+         "foreign_keys": [
+             {"column": "a_id", "references_table": "a",
+              "nullable": False}]},
+        {"name": "c", "rows": 1, "fields": {
+            "b_ref": {"type": "int"},
+            "note": {"type": "string"}},
+         "foreign_keys": [
+             {"column": "b_ref", "references_table": "b",
+              "references_column": "a_id", "nullable": False}]},
+    ]
+
+
+def abc_fx(a_name, b_label, c_note, seed):
+    return {"seed": seed,
+            "row_counts": {"a": 1, "b": 1, "c": 1},
+            "tables": {
+                "a": [{"id": 1, "name": a_name}],
+                "b": [{"a_id": 1, "label": b_label}],
+                "c": [{"b_ref": 1, "note": c_note}],
+            }}
+
+
+def test_merge_three_level_chain_relinks_grandchildren():
+    tables = abc_schema()
+    fx1 = abc_fx("aaaaaaaa", "bbbbbbbb", "cccccccc", 1)
+    fx2 = abc_fx("dddddddd", "eeeeeeee", "ffffffff", 2)
+    r = merge([fx1, fx2], tables, seed=11)
+    assert r.status_code == 200, r.text
+    out = r.json()["tables"]
+    # the first fixture's whole chain is untouched
+    assert out["a"][0] == {"id": 1, "name": "aaaaaaaa"}
+    assert out["b"][0] == {"a_id": 1, "label": "bbbbbbbb"}
+    assert out["c"][0] == {"b_ref": 1, "note": "cccccccc"}
+    # fixture 2's clashing a.id was rewritten; the rewrite propagated
+    # through b into c, so the grandchild points at its own fixture's
+    # b row instead of being stranded on fixture 1's key
+    new_key = out["a"][1]["id"]
+    assert new_key != 1 and out["a"][1]["name"] == "dddddddd"
+    assert out["b"][1]["a_id"] == new_key
+    assert out["b"][1]["label"] == "eeeeeeee"
+    assert out["c"][1]["b_ref"] == new_key
+    assert out["c"][1]["note"] == "ffffffff"
+
+
+def test_merge_consecutive_cascades_compose_across_four_levels():
+    # Every level's referenced column is itself the FK to the level above,
+    # so the top-level rewrite must be re-published at each hop instead of
+    # letting lower levels re-roll their key from the parent pool (with
+    # three fixtures the pool holds several free keys and a re-roll can
+    # cross the chains between fixtures).
+    tables = [
+        {"name": "a", "rows": 1, "fields": {
+            "id": {"type": "int", "min_value": 1, "max_value": 1000,
+                   "unique": True}}},
+        {"name": "b", "rows": 1, "fields": {
+            "a_id": {"type": "int", "unique": True}},
+         "foreign_keys": [
+             {"column": "a_id", "references_table": "a",
+              "nullable": False}]},
+        {"name": "c", "rows": 1, "fields": {
+            "b_key": {"type": "int", "unique": True}},
+         "foreign_keys": [
+             {"column": "b_key", "references_table": "b",
+              "references_column": "a_id", "nullable": False}]},
+        {"name": "d", "rows": 1, "fields": {
+            "c_key": {"type": "int"}},
+         "foreign_keys": [
+             {"column": "c_key", "references_table": "c",
+              "references_column": "b_key", "nullable": False}]},
+    ]
+
+    def chain_fx(tag, seed):
+        # same clashing key on every level; the extra tag field keeps the
+        # rows distinct so nothing is deduplicated
+        return {"seed": seed,
+                "row_counts": {"a": 1, "b": 1, "c": 1, "d": 1},
+                "tables": {
+                    "a": [{"id": 1, "tag": tag}],
+                    "b": [{"a_id": 1, "tag": tag}],
+                    "c": [{"b_key": 1, "tag": tag}],
+                    "d": [{"c_key": 1, "tag": tag}],
+                }}
+
+    r = merge([chain_fx("one", 1), chain_fx("two", 2), chain_fx("three", 3)],
+              tables, seed=1)
+    assert r.status_code == 200, r.text
+    out = r.json()["tables"]
+    levels = (("a", "id"), ("b", "a_id"), ("c", "b_key"), ("d", "c_key"))
+    # fixture 1 keeps the original key on every level
+    assert [out[t][0][col] for t, col in levels] == [1] * 4
+    # every other fixture's key was rewritten once at the top and the
+    # rewrite composed through every consecutive hop: within each fixture
+    # all four levels agree on that fixture's final key, the keys of
+    # different fixtures stay distinct, and extra fields are verbatim
+    used = {1}
+    for i, tag in ((1, "two"), (2, "three")):
+        chain = [out[t][i][col] for t, col in levels]
+        assert len(set(chain)) == 1
+        assert chain[0] not in used
+        used.add(chain[0])
+        assert [out[t][i]["tag"] for t in ("a", "b", "c", "d")] == [tag] * 4
+
+
+def test_merge_three_level_child_follows_parents_own_rewrite():
+    tables = abc_schema()
+    fx1 = abc_fx("aaaaaaaa", "bbbbbbbb", "cccccccc", 1)
+    fx2 = {"seed": 2, "row_counts": {"a": 2, "b": 1, "c": 1}, "tables": {
+        "a": [{"id": 1, "name": "aaaaaaaa"},   # identical to fx1: deduplicated
+              {"id": 2, "name": "dddddddd"}],
+        "b": [{"a_id": 1, "label": "eeeeeeee"}],  # a_id clash, no cascade
+        "c": [{"b_ref": 1, "note": "ffffffff"}],
+    }}
+    r = merge([fx1, fx2], tables, seed=17)
+    assert r.status_code == 200, r.text
+    out = r.json()["tables"]
+    assert out["a"] == [{"id": 1, "name": "aaaaaaaa"},
+                        {"id": 2, "name": "dddddddd"}]
+    # b's clashing a_id was repicked from the merged a values (only 2 is
+    # free); fixture 2's c row followed to that final value
+    assert out["b"][0] == {"a_id": 1, "label": "bbbbbbbb"}
+    assert out["b"][1] == {"a_id": 2, "label": "eeeeeeee"}
+    assert out["c"][0] == {"b_ref": 1, "note": "cccccccc"}
+    assert out["c"][1] == {"b_ref": 2, "note": "ffffffff"}
+
+
+def test_merge_three_level_child_of_deduplicated_parent_stays_put():
+    tables = abc_schema()
+    fx1 = abc_fx("aaaaaaaa", "bbbbbbbb", "cccccccc", 1)
+    fx2 = abc_fx("aaaaaaaa", "bbbbbbbb", "dddddddd", 2)  # same a and b rows
+    r = merge([fx1, fx2], tables)
+    assert r.status_code == 200, r.text
+    out = r.json()["tables"]
+    # identical a and b rows collapse to the first copy ...
+    assert out["a"] == [{"id": 1, "name": "aaaaaaaa"}]
+    assert out["b"] == [{"a_id": 1, "label": "bbbbbbbb"}]
+    # ... and both c rows keep pointing at the retained b row
+    assert out["c"] == [{"b_ref": 1, "note": "cccccccc"},
+                        {"b_ref": 1, "note": "dddddddd"}]
+
+
+def test_merge_cascade_follows_self_reference_in_middle_table():
+    tables = [
+        {"name": "p", "rows": 1, "fields": {
+            "id": {"type": "int", "min_value": 1, "max_value": 1000,
+                   "unique": True},
+            "tag": {"type": "string"}}},
+        {"name": "n", "rows": 2, "fields": {
+            "pid": {"type": "int", "unique": True}},
+         "foreign_keys": [
+             {"column": "pid", "references_table": "p", "nullable": False},
+             {"column": "parent_pid", "references_table": "n",
+              "references_column": "pid", "nullable": True}]},
+    ]
+    fx1 = {"seed": 1, "row_counts": {"p": 1, "n": 1}, "tables": {
+        "p": [{"id": 1, "tag": "aaaaaaaa"}],
+        "n": [{"pid": 1, "parent_pid": None}],
+    }}
+    fx2 = {"seed": 2, "row_counts": {"p": 2, "n": 2}, "tables": {
+        "p": [{"id": 1, "tag": "bbbbbbbb"},        # id clash -> rewritten
+              {"id": 2, "tag": "cccccccc"}],
+        "n": [{"pid": 1, "parent_pid": None},      # follows its p row
+              {"pid": 2, "parent_pid": 1}],        # self-ref follows too
+    }}
+    r = merge([fx1, fx2], tables, seed=19)
+    assert r.status_code == 200, r.text
+    out = r.json()["tables"]
+    new_id = out["p"][1]["id"]
+    assert new_id != 1 and out["p"][1]["tag"] == "bbbbbbbb"
+    # fixture 2's n rows: pid followed p's rewrite, and the self-reference
+    # from the same fixture points at the followed pid, not fixture 1's
+    assert out["n"][0] == {"pid": 1, "parent_pid": None}
+    assert out["n"][1]["pid"] == new_id
+    assert out["n"][2]["pid"] == 2
+    assert out["n"][2]["parent_pid"] == new_id
+
+
+def test_merge_three_level_unresolvable_is_422_without_partial_data():
+    tables = [
+        {"name": "a", "rows": 1, "fields": {
+            "id": {"type": "boolean", "unique": True},
+            "name": {"type": "string"}}},
+        {"name": "b", "rows": 1, "fields": {
+            "a_id": {"type": "boolean", "unique": True}},
+         "foreign_keys": [
+             {"column": "a_id", "references_table": "a",
+              "nullable": False}]},
+        {"name": "c", "rows": 1, "fields": {
+            "b_ref": {"type": "boolean"}},
+         "foreign_keys": [
+             {"column": "b_ref", "references_table": "b",
+              "references_column": "a_id", "nullable": False}]},
+    ]
+
+    def bool_fx(key, name, seed):
+        return {"seed": seed,
+                "row_counts": {"a": 1, "b": 1, "c": 1},
+                "tables": {
+                    "a": [{"id": key, "name": name}],
+                    "b": [{"a_id": key}],
+                    "c": [{"b_ref": key}],
+                }}
+
+    # three fixtures but only two boolean values for the unique a.id
+    r = merge([bool_fx(True, "aaaaaaaa", 1),
+               bool_fx(False, "bbbbbbbb", 2),
+               bool_fx(True, "cccccccc", 3)], tables)
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["type"] == "unique_space_exhausted"
+    assert set(r.json()) == {"detail"}  # no partial merge output
+
+
 # ------------------------------------------------------------- determinism
 
 
